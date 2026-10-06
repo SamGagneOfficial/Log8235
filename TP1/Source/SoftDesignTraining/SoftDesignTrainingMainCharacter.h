@@ -16,7 +16,6 @@ class SOFTDESIGNTRAINING_API ASoftDesignTrainingMainCharacter : public ASoftDesi
 public:
     ASoftDesignTrainingMainCharacter();
 
-    virtual void BeginPlay() override;
     virtual void OnCollectPowerUp() override;
 
     bool IsPoweredUp() { return m_IsPoweredUp; }

@@ -1,1457 +1,276 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "SDTAIController.h"
+#include "SoftDesignTraining.h"
 
-#include "SDTUtils.h"
 #include "SDTCollectible.h"
 #include "SoftDesignTrainingMainCharacter.h"
 
-#include "Components/CapsuleComponent.h"
+#include "Engine/World.h"
+//#include "DrawDebugHelpers.h"
 #include "Engine/OverlapResult.h"
-
-
-// ==========================================================
-// TICK
-// ==========================================================
 
 void ASDTAIController::Tick(float deltaTime)
 {
     Super::Tick(deltaTime);
 
+    UWorld* world = GetWorld();
     APawn* pawn = GetPawn();
 
-    if (!pawn)
-    {
+    if (!world || !pawn)
         return;
-    }
+
+    if (!m_Initiated)
+        Initialize(pawn);
+
+    FVector position = pawn->GetActorLocation();
+    FVector forward = m_Velocity.GetSafeNormal();
+    FVector up = pawn->GetActorUpVector();
 
 
-    // ==================================================
-    // 1. DEFAULT DESIRED DIRECTION
-    // ==================================================
+    if(TargetOutOfSight(position))      //Check if agent loses target
+        m_Target = nullptr;
 
-    FVector desiredDirection;
+    FVector deltaV = GetDeltaV(world, pawn, position, forward, deltaTime);
 
-    if (m_velocity.IsNearlyZero())
+    //Apply Steering when no direct target, avoiding rotation while in potential because of unpredictable energy gain/loss
+    if (!m_Target && deltaV.IsNearlyZero())
     {
-        desiredDirection = pawn->GetActorForwardVector();
-    }
-    else
-    {
-        desiredDirection = m_velocity.GetSafeNormal();
-    }
-
-    desiredDirection.Z = 0.0f;
-
-    if (!desiredDirection.IsNearlyZero())
-    {
-        desiredDirection.Normalize();
+        float steerAngle = GetSteeringAngle(world, pawn, position, forward, up);
+        float smoothAngle = FMath::FInterpTo(0.0f, steerAngle, deltaTime, 5.0f);
+        m_Velocity = m_Velocity.RotateAngleAxis(smoothAngle, up);
+        //DrawDebugSphere(world, position + GetReactDist() * forward.RotateAngleAxis(steerAngle, up), GetReactDist(), 32, FColor::Yellow);
     }
 
-
-    // ==================================================
-    // BEHAVIOR STATE FOR THIS FRAME
-    // ==================================================
-
-    bool isFleeing = false;
-    ASoftDesignTrainingMainCharacter* fleeingFromPlayer = nullptr;
-
-
-    // ==================================================
-    // 2. MAINTAIN EXISTING PLAYER LOCK
-    // ==================================================
-
-    if (m_targetPlayer.IsValid())
-    {
-        ASoftDesignTrainingMainCharacter* player = m_targetPlayer.Get();
-
-        float distanceToPlayer = FVector::Distance(
-            pawn->GetActorLocation(),
-            player->GetActorLocation()
-        );
-
-        if (distanceToPlayer > m_playerLoseRadius)
-        {
-            m_targetPlayer.Reset();
-        }
-    }
-
-
-    // ==================================================
-    // 3. ACQUIRE PLAYER
-    // ==================================================
-
-    if (!m_targetPlayer.IsValid())
-    {
-        ASoftDesignTrainingMainCharacter* detectedPlayer = nullptr;
-
-        if (DetectPlayer(detectedPlayer) && detectedPlayer)
-        {
-            m_targetPlayer = detectedPlayer;
-        }
-    }
-
-
-    // ==================================================
-    // 4. CHOOSE BEHAVIOR
-    // ==================================================
-
-    if (m_targetPlayer.IsValid())
-    {
-        ASoftDesignTrainingMainCharacter* player = m_targetPlayer.Get();
-
-
-        // ==============================================
-        // PLAYER POWERED UP -> FLEE
-        // ==============================================
-
-        if (player->IsPoweredUp())
-        {
-            isFleeing = true;
-            fleeingFromPlayer = player;
-
-            desiredDirection = pawn->GetActorLocation() - player->GetActorLocation();
-            desiredDirection.Z = 0.0f;
-
-            if (!desiredDirection.IsNearlyZero())
-            {
-                desiredDirection.Normalize();
-            }
-            else
-            {
-                desiredDirection = -pawn->GetActorForwardVector();
-                desiredDirection.Z = 0.0f;
-                desiredDirection.Normalize();
-            }
-        }
-
-
-        // PLAYER NOT POWERED UP -> PURSUE
-
-        else
-        {
-            desiredDirection = player->GetActorLocation() - pawn->GetActorLocation();
-            desiredDirection.Z = 0.0f;
-            if (!desiredDirection.IsNearlyZero())
-            {
-                desiredDirection.Normalize();
-            }
-        }
-    }
-
-
-    // 5. NO PLAYER TARGET -> LOOK FOR COLLECTIBLE
-
-    else
-    {
-        ASDTCollectible* collectible = nullptr;
-
-        if (DetectClosestCollectible(collectible) && IsPathClearToCollectible(collectible))
-        {
-            desiredDirection = collectible->GetActorLocation() - pawn->GetActorLocation();
-            desiredDirection.Z = 0.0f;
-
-            if (!desiredDirection.IsNearlyZero())
-            {
-                desiredDirection.Normalize();
-            }
-        }
-    }
-
-
-    // 6. DETECT BEHAVIOR TRANSITIONS
-
-    bool justStoppedFleeing = m_wasFleeing && !isFleeing;
-    bool justStartedFleeing = !m_wasFleeing && isFleeing;
-
-    if (m_isEmergencyTurning && (justStartedFleeing || justStoppedFleeing))
-    {
-        m_isEmergencyTurning = false;
-        m_emergencyTurnDirection = FVector::ZeroVector;
-    }
-
-
-    // 7. RESET FLEE MEMORY WHEN NOT FLEEING
-
-    if (!isFleeing)
-    {
-        m_hasFleeDirection = false;
-        m_lastFleeDirection = FVector::ZeroVector;
-    }
-
-
-    // 8. CENTRAL NAVIGATION
-
-    FVector safeDirection = FVector::ZeroVector;
-    bool foundSafeDirection = false;
-
-    if (!m_isEmergencyTurning)
-    {
-        // FLEE NAVIGATION
-
-        if (isFleeing && fleeingFromPlayer)
-        {
-            foundSafeDirection = FindSafeFleeDirection(fleeingFromPlayer,safeDirection);
-        }
-
-        // NORMAL NAVIGATION
-
-        else
-        {
-            foundSafeDirection = FindSafeDirection(desiredDirection,safeDirection);
-        }
-
-
-        // SHOULD WE ENTER EMERGENCY TURN MODE?
-
-        if (foundSafeDirection && !m_velocity.IsNearlyZero())
-        {
-            FVector currentDirection = m_velocity.GetSafeNormal();
-
-            currentDirection.Z = 0.0f;
-            currentDirection.Normalize();
-
-            safeDirection.Z = 0.0f;
-            safeDirection.Normalize();
-
-            float alignment = FVector::DotProduct(currentDirection,safeDirection);
-
-            float turnLimitedSpeed = GetTurnLimitedSpeed(currentDirection,safeDirection);
-
-            bool physicalEmergencyTurn = alignment < m_emergencyPhysicalTurnAlignment && turnLimitedSpeed < m_emergencyTurnSpeedThreshold;
-
-            bool transitionEmergencyTurn = justStoppedFleeing && alignment < 0.0f;
-
-            if (physicalEmergencyTurn || transitionEmergencyTurn)
-            {
-                StartEmergencyTurn(safeDirection);
-            }
-        }
-    }
-
-
-    // 9. EMERGENCY STOP / TURN
-
-    if (m_isEmergencyTurning)
-    {
-        UpdateEmergencyTurn(pawn, deltaTime);
-    }
-
-    // 10. NORMAL SAFE MOVEMENT
-
-    else if (foundSafeDirection)
-    {
-        m_lastSafeDirection = safeDirection;
-
-        UpdateVelocityTowardsDirection(safeDirection,deltaTime);
-    }
-
-
-    // 11. NO SAFE DIRECTION -> BRAKE
-    else
-    {
-        if (!m_velocity.IsNearlyZero())
-        {
-            FVector currentDirection = m_velocity.GetSafeNormal();
-
-            float newSpeed = FMath::FInterpConstantTo(
-                m_velocity.Size(),
-                0.0f,
-                deltaTime,
-                m_maxDeceleration
-            );
-
-            if (newSpeed <= KINDA_SMALL_NUMBER)
-            {
-                m_velocity = FVector::ZeroVector;
-            }
-            else
-            {
-                m_velocity = currentDirection * newSpeed;
-            }
-        }
-    }
-
-
-    // 12. PROPOSE MOVEMENT
-
-    FVector desiredMovementDelta = m_velocity * deltaTime;
-
-
-    // 13. FINAL HARD SAFETY CHECK
-
-    FVector safeMovementDelta = GetSafeMovementDelta(desiredMovementDelta);
-
-    if (safeMovementDelta.SizeSquared() < desiredMovementDelta.SizeSquared())
-    {
-        if (deltaTime > KINDA_SMALL_NUMBER)
-        {
-            m_velocity = safeMovementDelta / deltaTime;
-        }
-        else
-        {
-            m_velocity = FVector::ZeroVector;
-        }
-    }
-
-
-    // 14. APPLY MOVEMENT
-
-    pawn->AddActorWorldOffset(safeMovementDelta,true);
-
-
-    // 15. ORIENT PAWN WHILE MOVING
-
-    if (!m_velocity.IsNearlyZero())
-    {
-        pawn->SetActorRotation(m_velocity.ToOrientationQuat());
-    }
-
-    // 16. SAVE BEHAVIOR STATE FOR NEXT FRAME
-
-    m_wasFleeing = isFleeing;
+    m_Velocity += deltaV;
+    m_Velocity.Z = 0;
+
+	pawn->SetActorRotation(m_Velocity.ToOrientationQuat());
+    pawn->AddActorWorldOffset(m_Velocity * deltaTime, true);
 }
 
+void ASDTAIController::Initialize(APawn* pawn) {
 
-// START EMERGENCY TURN
-void ASDTAIController::StartEmergencyTurn(const FVector& direction)
-{
-    FVector emergencyDirection = direction;
+    m_Thickness = pawn->FindComponentByClass<UCapsuleComponent>()->GetScaledCapsuleRadius();
 
-    emergencyDirection.Z = 0.0f;
+    if (!m_Thickness)
+        m_Thickness = 30.0f;
 
-    if (emergencyDirection.IsNearlyZero())
-    {
-        return;
-    }
+    //Forces rayAmount to be odd, so one ray points forward
+    if (!(m_RayAmount % 2))
+        m_RayAmount++;
 
-    emergencyDirection.Normalize();
+    m_Inertia = m_Mass * m_Thickness * m_Thickness * 0.5f; //Inertia approximated by cylinder
 
-    m_emergencyTurnDirection = emergencyDirection;
-    m_isEmergencyTurning = true;
+    float maxSpeed = pawn->GetMovementComponent()->GetMaxSpeed();
+    m_WalkSpeed = 0.4 * maxSpeed;
+
+    m_EnergyBank = GetKinEnergy();
+
+    m_Velocity = m_WalkSpeed * pawn->GetActorForwardVector();
+    UE_LOG(LogTemp,Warning,TEXT("Agent Initiated"));
+    m_Initiated = true;
 }
 
+float ASDTAIController::EvaluatePotential(float distance) {
+    return GetKinEnergy() * (2 - distance / GetReactDist());
+}
 
-// UPDATE EMERGENCY TURN
-void ASDTAIController::UpdateEmergencyTurn(APawn* pawn,float deltaTime)
-{
-    if (!pawn || !m_isEmergencyTurning)
+float ASDTAIController::GetSteeringAngle(UWorld* world, APawn* pawn, FVector position, FVector forward, FVector up) {
+
+    /*
+    Shoots m_RayAmount rays from -60.0 to 60.0 deg, evaluating where the potential related to walls is null in order to reduce sways
+    */
+
+    FCollisionQueryParams collisionParams;
+    collisionParams.AddIgnoredActor(pawn);
+
+    //Score/potential for each evaluated point to influence steering
+    TArray<float> potentials;
+    potentials.SetNumZeroed(m_RayAmount);
+
+    float angleInc = (m_RayAmount > 1) ? 120.0f / (m_RayAmount - 1) : 0;
+
+    //Evaluate the potential energy for points ahead, hoping to pick the
+    for(int i = 0; i < m_RayAmount; i++)
     {
-        return;
-    }
+        TArray<FOverlapResult> overlaps;
+        FVector endPos = position + GetReactDist() * forward.RotateAngleAxis(-60.0f + i * angleInc, up);
 
-    // PHASE 1 - BRAKE TO ZERO
-
-    if (!m_velocity.IsNearlyZero())
-    {
-        FVector currentDirection = m_velocity.GetSafeNormal();
-
-        float newSpeed = FMath::FInterpConstantTo(
-            m_velocity.Size(),
-            0.0f,
-            deltaTime,
-            m_maxDeceleration
-        );
-
-        if (newSpeed <= KINDA_SMALL_NUMBER)
+        //Skip that direction if wall is in the way
+        FHitResult hit;
+        if (world->LineTraceSingleByChannel(hit, position, endPos, ECC_Pawn, collisionParams))
         {
-            m_velocity = FVector::ZeroVector;
+            potentials[i] = -1.0f;  //negative for later score check
+            continue;
         }
-        else
-        {
-            m_velocity = currentDirection * newSpeed;
-        }
 
-        return;
-    }
-
-    // PHASE 2 - ROTATE IN PLACE
-    m_velocity = FVector::ZeroVector;
-
-    FVector targetDirection = m_emergencyTurnDirection;
-    targetDirection.Z = 0.0f;
-
-    if (targetDirection.IsNearlyZero())
-    {
-        m_isEmergencyTurning = false;
-        return;
-    }
-
-    targetDirection.Normalize();
-
-    FQuat currentRotation = pawn->GetActorQuat();
-    FQuat targetRotation = targetDirection.ToOrientationQuat();
-
-    float angleDifference = currentRotation.AngularDistance(targetRotation);
-
-    float maxTurnThisFrame = FMath::DegreesToRadians(m_turnSpeed) * deltaTime;
-
-    float alpha;
-
-    if (angleDifference > KINDA_SMALL_NUMBER)
-    {
-        alpha = FMath::Clamp(
-            maxTurnThisFrame / angleDifference,
-            0.0f,
-            1.0f
-        );
-    }
-    else
-    {
-        alpha = 1.0f;
-    }
-
-    FQuat newRotation = FQuat::Slerp(
-        currentRotation,
-        targetRotation,
-        alpha
-    );
-
-    pawn->SetActorRotation(newRotation);
-
-
-    // CHECK WHETHER TURN IS COMPLETE
-    FVector newForwardDirection = newRotation.GetForwardVector();
-
-    newForwardDirection.Z = 0.0f;
-    newForwardDirection.Normalize();
-
-    float alignment = FVector::DotProduct(
-        newForwardDirection,
-        targetDirection
-    );
-
-    if (alignment > m_emergencyTurnAlignment)
-    {
-        pawn->SetActorRotation(targetRotation);
-
-        m_lastSafeDirection = targetDirection;
-        m_isEmergencyTurning = false;
-    }
-}
-
-
-// LOOK-AHEAD DISTANCE
-
-float ASDTAIController::GetLookAheadDistance() const
-{
-    float lookAheadDistance = m_velocity.Size() * m_lookAheadTime;
-
-    return FMath::Clamp(
-        lookAheadDistance,
-        m_minLookAheadDistance,
-        m_maxLookAheadDistance
-    );
-}
-
-
-// WALL CAPSULE SWEEP
-bool ASDTAIController::SweepDirection(
-    const FVector& direction,
-    float distance,
-    float clearance,
-    FHitResult& hitResult
-)
-{
-    APawn* pawn = GetPawn();
-
-    if (!pawn)
-    {
-        return false;
-    }
-
-    UCapsuleComponent* capsule = pawn->FindComponentByClass<UCapsuleComponent>();
-
-    if (!capsule)
-    {
-        return false;
-    }
-
-    FVector normalizedDirection = direction;
-    normalizedDirection.Z = 0.0f;
-
-    if (normalizedDirection.IsNearlyZero())
-    {
-        return false;
-    }
-
-    normalizedDirection.Normalize();
-
-    FVector start = pawn->GetActorLocation();
-    FVector end = start + normalizedDirection * distance;
-
-    float radius = capsule->GetScaledCapsuleRadius();
-
-    float halfHeight = capsule->GetScaledCapsuleHalfHeight();
-
-    FCollisionShape collisionShape = FCollisionShape::MakeCapsule(radius,halfHeight);
-
-    FCollisionQueryParams queryParams;
-    queryParams.AddIgnoredActor(pawn);
-
-    if (m_targetPlayer.IsValid())
-    {
-        queryParams.AddIgnoredActor(m_targetPlayer.Get());
-    }
-
-    return GetWorld()->SweepSingleByChannel(
-        hitResult,
-        start,
-        end,
-        FQuat::Identity,
-        ECC_Visibility,
-        collisionShape,
-        queryParams
-    );
-}
-
-
-// DEATH-FLOOR PATH CHECK
-bool ASDTAIController::IsDeathFloorPathUnsafe(
-    const FVector& direction,
-    float distance
-)
-{
-    APawn* pawn = GetPawn();
-
-    if (!pawn)
-    {
-        return true;
-    }
-
-    UCapsuleComponent* capsule = pawn->FindComponentByClass<UCapsuleComponent>();
-
-    if (!capsule)
-    {
-        return true;
-    }
-
-    FVector normalizedDirection = direction;
-    normalizedDirection.Z = 0.0f;
-
-    if (normalizedDirection.IsNearlyZero())
-    {
-        return false;
-    }
-
-    normalizedDirection.Normalize();
-
-    float capsuleRadius = capsule->GetScaledCapsuleRadius();
-
-    float capsuleHalfHeight = capsule->GetScaledCapsuleHalfHeight();
-
-    float footprintRadius = capsuleRadius + m_deathFloorClearance;
-
-    FVector groundProbeStart = pawn->GetActorLocation() - FVector::UpVector * (capsuleHalfHeight - footprintRadius + m_deathFloorProbeSink);
-    FVector groundProbeEnd = groundProbeStart + normalizedDirection * distance;
-    FCollisionShape footprintShape = FCollisionShape::MakeSphere(footprintRadius);
-
-    FCollisionObjectQueryParams objectQueryParams;
-    objectQueryParams.AddObjectTypesToQuery(COLLISION_DEATH_OBJECT);
-
-    FCollisionQueryParams queryParams;
-    queryParams.AddIgnoredActor(pawn);
-
-    FHitResult deathFloorHit;
-
-    return GetWorld()->SweepSingleByObjectType(
-        deathFloorHit,
-        groundProbeStart,
-        groundProbeEnd,
-        FQuat::Identity,
-        objectQueryParams,
-        footprintShape,
-        queryParams
-    );
-}
-
-
-// COMPLETE NAVIGATION SAFETY CHECK
-bool ASDTAIController::IsNavigationDirectionSafe(const FVector& direction,float distance)
-{
-    if (direction.IsNearlyZero())
-    {
-        return false;
-    }
-
-    FHitResult wallHit;
-
-    if (SweepDirection(
-        direction,
-        distance,
-        0.0f,
-        wallHit))
-    {
-        return false;
-    }
-
-    if (IsDeathFloorPathUnsafe(
-        direction,
-        distance))
-    {
-        return false;
-    }
-
-    return true;
-}
-
-
-// FIND NORMAL SAFE DIRECTION
-bool ASDTAIController::FindSafeDirection(const FVector& desiredDirection,FVector& safeDirection)
-{
-    FVector desired = desiredDirection;
-    desired.Z = 0.0f;
-
-    if (desired.IsNearlyZero())
-    {
-        return false;
-    }
-    desired.Normalize();
-
-    FVector currentDirection;
-
-    if (m_velocity.IsNearlyZero())
-    {
-        currentDirection = desired;
-    }
-    else
-    {
-        currentDirection = m_velocity.GetSafeNormal();
-    }
-
-    currentDirection.Z = 0.0f;
-    currentDirection.Normalize();
-
-
-    FVector previousSafeDirection = m_lastSafeDirection;
-
-    previousSafeDirection.Z = 0.0f;
-
-    if (previousSafeDirection.IsNearlyZero())
-    {
-        previousSafeDirection = currentDirection;
-    }
-    else
-    {
-        previousSafeDirection.Normalize();
-    }
-
-    float const candidateAngles[] =
-    {
-        0.0f,
-        15.0f, -15.0f,
-        30.0f, -30.0f,
-        45.0f, -45.0f,
-        60.0f, -60.0f,
-        75.0f, -75.0f,
-        90.0f, -90.0f,
-        120.0f, -120.0f,
-        150.0f, -150.0f,
-        180.0f
-    };
-
-
-    auto FindBestCandidate =
-        [&](float probeDistance, FVector& bestDirection) -> bool
-        {
-            bool foundDirection = false;
-            float bestScore = -FLT_MAX;
-
-            for (float angle : candidateAngles)
-            {
-                FVector candidateDirection =
-                    desired.RotateAngleAxis(
-                        angle,
-                        FVector::UpVector
-                    );
-
-                candidateDirection.Z = 0.0f;
-                candidateDirection.Normalize();
-
-                if (!IsNavigationDirectionSafe(
-                    candidateDirection,
-                    probeDistance))
-                {
-                    continue;
-                }
-
-                float desiredAlignment = FVector::DotProduct(
-                    candidateDirection,
-                    desired
-                );
-
-                float currentAlignment = FVector::DotProduct(
-                    candidateDirection,
-                    currentDirection
-                );
-
-                float previousAlignment = FVector::DotProduct(
-                    candidateDirection,
-                    previousSafeDirection
-                );
-
-                float score =
-                    desiredAlignment * 0.65f
-                    + currentAlignment * 0.20f
-                    + previousAlignment * 0.15f;
-
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestDirection = candidateDirection;
-                    foundDirection = true;
-                }
-            }
-
-            return foundDirection;
-        };
-
-
-    if (FindBestCandidate(
-        GetLookAheadDistance(),
-        safeDirection))
-    {
-        return true;
-    }
-
-    if (FindBestCandidate(
-        m_emergencyProbeDistance,
-        safeDirection))
-    {
-        return true;
-    }
-
-    return false;
-}
-
-
-// FIND SAFE FLEE DIRECTION WITH HYSTERESIS
-
-bool ASDTAIController::FindSafeFleeDirection(
-    ASoftDesignTrainingMainCharacter* player,
-    FVector& safeDirection
-)
-{
-    APawn* pawn = GetPawn();
-
-    if (!pawn || !player)
-    {
-        return false;
-    }
-
-
-    FVector directionAwayFromPlayer =
-        pawn->GetActorLocation()
-        - player->GetActorLocation();
-
-    directionAwayFromPlayer.Z = 0.0f;
-
-    if (directionAwayFromPlayer.IsNearlyZero())
-    {
-        return false;
-    }
-
-    directionAwayFromPlayer.Normalize();
-
-
-    FVector currentDirection;
-
-    if (m_velocity.IsNearlyZero())
-    {
-        currentDirection =
-            pawn->GetActorForwardVector();
-    }
-    else
-    {
-        currentDirection =
-            m_velocity.GetSafeNormal();
-    }
-
-    currentDirection.Z = 0.0f;
-
-    if (!currentDirection.IsNearlyZero())
-    {
-        currentDirection.Normalize();
-    }
-
-
-    float const candidateAngles[] =
-    {
-        0.0f,
-        15.0f, -15.0f,
-        30.0f, -30.0f,
-        45.0f, -45.0f,
-        60.0f, -60.0f,
-        75.0f, -75.0f,
-        90.0f, -90.0f,
-        120.0f, -120.0f,
-        150.0f, -150.0f,
-        180.0f
-    };
-
-
-    auto EvaluateDirection =
-        [&](const FVector& candidateDirection,
-            float probeDistance) -> float
-        {
-            FVector futurePosition =
-                pawn->GetActorLocation()
-                + candidateDirection * probeDistance;
-
-            float currentDistanceToPlayer =
-                FVector::Dist2D(
-                    pawn->GetActorLocation(),
-                    player->GetActorLocation()
-                );
-
-            float futureDistanceToPlayer =
-                FVector::Dist2D(
-                    futurePosition,
-                    player->GetActorLocation()
-                );
-
-            float distanceGain =
-                (
-                    futureDistanceToPlayer
-                    - currentDistanceToPlayer
-                    )
-                / probeDistance;
-
-            distanceGain = FMath::Clamp(
-                distanceGain,
-                -1.0f,
-                1.0f
-            );
-
-            float currentAlignment =
-                FVector::DotProduct(
-                    candidateDirection,
-                    currentDirection
-                );
-
-            float previousAlignment = 0.0f;
-
-            if (m_hasFleeDirection &&
-                !m_lastFleeDirection.IsNearlyZero())
-            {
-                previousAlignment =
-                    FVector::DotProduct(
-                        candidateDirection,
-                        m_lastFleeDirection
-                    );
-            }
-
-            return
-                distanceGain * 0.65f
-                + currentAlignment * 0.20f
-                + previousAlignment * 0.15f;
-        };
-
-
-    auto FindDirectionAtDistance =
-        [&](float probeDistance,
-            FVector& selectedDirection) -> bool
-        {
-            bool foundCandidate = false;
-
-            FVector bestCandidate =
-                FVector::ZeroVector;
-
-            float bestCandidateScore =
-                -FLT_MAX;
-
-
-            // ----------------------------------------------
-            // SEARCH NEW CANDIDATES
-            // ----------------------------------------------
-
-            for (float angle : candidateAngles)
-            {
-                FVector candidateDirection =
-                    directionAwayFromPlayer.RotateAngleAxis(
-                        angle,
-                        FVector::UpVector
-                    );
-
-                candidateDirection.Z = 0.0f;
-                candidateDirection.Normalize();
-
-                if (!IsNavigationDirectionSafe(
-                    candidateDirection,
-                    probeDistance))
-                {
-                    continue;
-                }
-
-                float score =
-                    EvaluateDirection(
-                        candidateDirection,
-                        probeDistance
-                    );
-
-                if (score > bestCandidateScore)
-                {
-                    bestCandidateScore = score;
-                    bestCandidate = candidateDirection;
-                    foundCandidate = true;
-                }
-            }
-
-
-            // ----------------------------------------------
-            // CHECK REMEMBERED FLEE DIRECTION
-            // ----------------------------------------------
-
-            bool previousDirectionIsSafe = false;
-            float previousDirectionScore = -FLT_MAX;
-
-            if (m_hasFleeDirection &&
-                !m_lastFleeDirection.IsNearlyZero())
-            {
-                previousDirectionIsSafe =
-                    IsNavigationDirectionSafe(
-                        m_lastFleeDirection,
-                        probeDistance
-                    );
-
-                if (previousDirectionIsSafe)
-                {
-                    previousDirectionScore =
-                        EvaluateDirection(
-                            m_lastFleeDirection,
-                            probeDistance
-                        );
-                }
-            }
-
-
-            // ----------------------------------------------
-            // KEEP CURRENT FLEE DIRECTION
-            // ----------------------------------------------
-
-            if (previousDirectionIsSafe)
-            {
-                if (!foundCandidate ||
-                    bestCandidateScore <=
-                    previousDirectionScore
-                    + m_fleeDirectionSwitchThreshold)
-                {
-                    selectedDirection =
-                        m_lastFleeDirection;
-
-                    return true;
-                }
-            }
-
-
-            // ----------------------------------------------
-            // SWITCH TO BETTER FLEE DIRECTION
-            // ----------------------------------------------
-
-            if (foundCandidate)
-            {
-                selectedDirection = bestCandidate;
-                m_lastFleeDirection = bestCandidate;
-                m_hasFleeDirection = true;
-
-                return true;
-            }
-
-            return false;
-        };
-
-
-    if (FindDirectionAtDistance(
-        GetLookAheadDistance(),
-        safeDirection))
-    {
-        return true;
-    }
-
-    if (FindDirectionAtDistance(
-        m_emergencyProbeDistance,
-        safeDirection))
-    {
-        return true;
-    }
-
-    m_hasFleeDirection = false;
-    m_lastFleeDirection = FVector::ZeroVector;
-
-    return false;
-}
-
-
-// ==========================================================
-// WALL / BRAKING LIMITED SPEED
-// ==========================================================
-
-float ASDTAIController::GetTargetSpeedForDirection(
-    const FVector& direction
-)
-{
-    float lookAheadDistance =
-        GetLookAheadDistance();
-
-    FHitResult wallHit;
-
-    bool wallAhead = SweepDirection(
-        direction,
-        lookAheadDistance,
-        0.0f,
-        wallHit
-    );
-
-    if (!wallAhead)
-    {
-        return m_maxSpeed;
-    }
-
-    float brakingDistance = FMath::Max(
-        wallHit.Distance - m_wallClearance,
-        0.0f
-    );
-
-    float maximumSafeSpeed = FMath::Sqrt(
-        2.0f
-        * m_maxDeceleration
-        * brakingDistance
-    );
-
-    return FMath::Clamp(
-        maximumSafeSpeed,
-        0.0f,
-        m_maxSpeed
-    );
-}
-
-
-// ==========================================================
-// TURN-LIMITED SPEED
-// ==========================================================
-
-float ASDTAIController::GetTurnLimitedSpeed(
-    const FVector& currentDirection,
-    const FVector& targetDirection
-)
-{
-    FVector current = currentDirection.GetSafeNormal();
-
-    FVector target = targetDirection.GetSafeNormal();
-
-    if (current.IsNearlyZero() || target.IsNearlyZero())
-    {
-        return 0.0f;
-    }
-
-    float alignment = FMath::Clamp(
-        FVector::DotProduct(
-            current,
-            target
-        ),
-        -1.0f,
-        1.0f
-    );
-
-    float angleDifference = FMath::Acos(alignment);
-
-    if (angleDifference < FMath::DegreesToRadians(5.0f))
-    {
-        return m_maxSpeed;
-    }
-
-
-    FHitResult wallHit;
-
-    bool wallAhead = SweepDirection(
-        current,
-        m_maxLookAheadDistance,
-        0.0f,
-        wallHit
-    );
-
-    if (!wallAhead)
-    {
-        return m_maxSpeed;
-    }
-
-    float availableDistance = FMath::Max(
-        wallHit.Distance - m_wallClearance,
-        0.0f
-    );
-
-    float angularSpeed =
-        FMath::DegreesToRadians(
-            m_turnSpeed
-        );
-
-    if (angularSpeed < KINDA_SMALL_NUMBER)
-    {
-        return 0.0f;
-    }
-
-    float turnTime =
-        angleDifference / angularSpeed;
-
-    if (turnTime < KINDA_SMALL_NUMBER)
-    {
-        return m_maxSpeed;
-    }
-
-    float maximumTurnSpeed =
-        availableDistance / turnTime;
-
-    return FMath::Clamp(
-        maximumTurnSpeed,
-        0.0f,
-        m_maxSpeed
-    );
-}
-
-
-// SMOOTH VELOCITY UPDATE
-void ASDTAIController::UpdateVelocityTowardsDirection(const FVector& direction,float deltaTime)
-{
-    APawn* pawn = GetPawn();
-
-    if (!pawn)
-    {
-        return;
-    }
-
-    FVector targetDirection = direction;
-    targetDirection.Z = 0.0f;
-
-    if (targetDirection.IsNearlyZero())
-    {
-        return;
-    }
-
-    targetDirection.Normalize();
-
-
-    // CURRENT DIRECTION
-    FVector currentDirection;
-
-    if (!m_velocity.IsNearlyZero())
-    {
-        currentDirection = m_velocity.GetSafeNormal();
-    }
-    else
-    {
-        currentDirection = pawn->GetActorForwardVector();
-
-        currentDirection.Z = 0.0f;
-        currentDirection.Normalize();
-    }
-
-    // ROTATE TOWARD TARGET DIRECTION
-    FQuat currentRotation = currentDirection.ToOrientationQuat();
-
-    FQuat targetRotation = targetDirection.ToOrientationQuat();
-
-    float angleDifference = currentRotation.AngularDistance(targetRotation);
-
-    float maxTurnThisFrame =FMath::DegreesToRadians(m_turnSpeed) * deltaTime;
-
-    float alpha;
-
-    if (angleDifference > KINDA_SMALL_NUMBER)
-    {
-        alpha = FMath::Clamp(
-            maxTurnThisFrame / angleDifference,
-            0.0f,
-            1.0f
-        );
-    }
-    else
-    {
-        alpha = 1.0f;
-    }
-
-    FQuat newRotation = FQuat::Slerp(
-        currentRotation,
-        targetRotation,
-        alpha
-    );
-
-    FVector newDirection =
-        newRotation.GetForwardVector();
-
-    newDirection.Z = 0.0f;
-    newDirection.Normalize();
-
-
-    // SPEED LIMITS
-    float obstacleLimitedSpeed = GetTargetSpeedForDirection(newDirection);
-    float turnLimitedSpeed = GetTurnLimitedSpeed(currentDirection,targetDirection);
-    float targetSpeed = FMath::Min(obstacleLimitedSpeed,turnLimitedSpeed);
-
-
-    // ACCELERATION / DECELERATION
-    float currentSpeed = m_velocity.Size();
-
-    float speedChangeRate;
-
-    if (targetSpeed >= currentSpeed)
-    {
-        speedChangeRate = m_maxAcceleration;
-    }
-    else
-    {
-        speedChangeRate = m_maxDeceleration;
-    }
-
-    float newSpeed = FMath::FInterpConstantTo(currentSpeed,targetSpeed,deltaTime,speedChangeRate);
-
-    m_velocity = newDirection * newSpeed;
-}
-
-// FINAL HARD MOVEMENT SAFETY
-FVector ASDTAIController::GetSafeMovementDelta(const FVector& desiredMovementDelta)
-{
-    float desiredDistance = desiredMovementDelta.Size();
-
-    if (desiredDistance < KINDA_SMALL_NUMBER)
-    {
-        return FVector::ZeroVector;
-    }
-
-    FVector movementDirection = desiredMovementDelta / desiredDistance;
-
-
-    // WALL CHECK
-    FHitResult wallHit;
-
-    bool wallWouldBeHit =
-        SweepDirection(
-            movementDirection,
-            desiredDistance,
-            0.0f,
-            wallHit
-        );
-
-    float safeDistance = desiredDistance;
-
-    if (wallWouldBeHit)
-    {
-        safeDistance = FMath::Max(
-            wallHit.Distance - m_wallClearance,
-            0.0f
-        );
-    }
-
-
-    // DEATH-FLOOR CHECK
-    if (safeDistance > KINDA_SMALL_NUMBER &&
-        IsDeathFloorPathUnsafe(
-            movementDirection,
-            safeDistance))
-    {
-        return FVector::ZeroVector;
-    }
-
-
-    return movementDirection * safeDistance;
-}
-
-
-// COLLECTIBLE DETECTION
-
-bool ASDTAIController::DetectClosestCollectible(ASDTCollectible*& collectible)
-{
-    APawn* pawn = GetPawn();
-
-    collectible = nullptr;
-
-    if (!pawn)
-    {
-        return false;
-    }
-
-    FCollisionObjectQueryParams objectQueryParams;
-    objectQueryParams.AddObjectTypesToQuery(COLLISION_COLLECTIBLE);
-
-    FCollisionQueryParams queryParams;
-    queryParams.AddIgnoredActor(pawn);
-
-    FCollisionShape detectionSphere = FCollisionShape::MakeSphere(m_collectibleDetectionRadius);
-
-    TArray<FOverlapResult> overlapResults;
-
-    bool hasOverlap =
-        GetWorld()->OverlapMultiByObjectType(
-            overlapResults,
-            pawn->GetActorLocation(),
+        world->OverlapMultiByChannel(
+            overlaps,
+            endPos,
             FQuat::Identity,
-            objectQueryParams,
-            detectionSphere,
-            queryParams
+            ECC_Pawn,
+            FCollisionShape::MakeSphere(GetReactDist()),
+            collisionParams
         );
 
-    if (!hasOverlap)
-    {
-        return false;
-    }
-
-    FVector currentDirection;
-
-    if (m_velocity.IsNearlyZero())
-    {
-        currentDirection = pawn->GetActorForwardVector();
-    }
-    else
-    {
-        currentDirection = m_velocity.GetSafeNormal();
-    }
-    currentDirection.Z = 0.0f;
-    currentDirection.Normalize();
-
-    float minimumAlignment = FMath::Cos(FMath::DegreesToRadians(m_visionAngle * 0.5f));
-    float closestDistanceSquared = FLT_MAX;
-
-    for (const FOverlapResult& overlap : overlapResults)
-    {
-        ASDTCollectible* candidate = Cast<ASDTCollectible>(overlap.GetActor());
-
-        if (!candidate)
+        //Looping through each walls
+        for (const FOverlapResult& overlap : overlaps)
         {
-            continue;
-        }
+            UPrimitiveComponent* component = overlap.GetComponent();
 
-        if (candidate->IsOnCooldown())
-        {
-            continue;
-        }
+            if (component)
+            {
+                ECollisionChannel channel = component->GetCollisionObjectType();
+                FVector closestPoint = FVector::Zero();
 
-        FVector directionToCollectible = candidate->GetActorLocation() - pawn->GetActorLocation();
-        directionToCollectible.Z = 0.0f;
+                if ((channel == ECC_WorldStatic || channel == ECC_GameTraceChannel3))
+                    if (component->GetClosestPointOnCollision(endPos, closestPoint))
+                    {
+                        float minDist = GetReactDist();
+                        float distance = (closestPoint - endPos).Size2D();
 
-        float distanceSquared = directionToCollectible.SizeSquared();
-
-        if (distanceSquared < KINDA_SMALL_NUMBER)
-        {
-            continue;
-        }
-
-        directionToCollectible.Normalize();
-
-        float alignment = FVector::DotProduct(currentDirection,directionToCollectible);
-
-        if (alignment < minimumAlignment)
-        {
-            continue;
-        }
-
-        if (distanceSquared < closestDistanceSquared)
-        {
-            closestDistanceSquared = distanceSquared;
-
-            collectible = candidate;
+                        if (distance < minDist)
+                            potentials[i] += EvaluatePotential(distance);
+                    }
+            }
         }
     }
 
-    return collectible != nullptr;
+    //check for a ray matching the zero potential requirement, starting with those closest to forward vector (of middle of array)
+    if (potentials.Contains(0.0f) && potentials[m_RayAmount / 2] != 0.0f)
+    {
+        int rand = FMath::RandRange(0, 1) ? 1 : -1; //-1 or 1 for right - left
+        for (int i = 0; i < m_RayAmount / 2; i++)
+        {
+            if (potentials[(m_RayAmount / 2) + i * rand] == 0.0f)
+                return rand * i * angleInc;
+
+            if (potentials[(m_RayAmount / 2) - i * rand] == 0.0f)
+                return -rand * i * angleInc;
+        }
+    }
+    
+    //Lets the potential force do its thing
+    return 0.0f;
 }
 
+FVector ASDTAIController::GetDeltaV(UWorld* world, APawn* pawn, FVector position, FVector forward, float deltaTime) {
 
-// COLLECTIBLE PATH CHECK
-bool ASDTAIController::IsPathClearToCollectible(ASDTCollectible* collectible)
-{
-    APawn* pawn = GetPawn();
+    FVector deltaV = FVector::Zero();
 
-    if (!pawn || !collectible)
+    FCollisionQueryParams params;
+    params.AddIgnoredActor(pawn);
+
+    TArray<FOverlapResult> overlaps;
+
+    world->OverlapMultiByChannel(
+        overlaps,
+        position,
+        FQuat::Identity,
+        ECC_Pawn,
+        FCollisionShape::MakeSphere(m_VisionRange),
+        params
+    );
+
+    for (const FOverlapResult& overlap : overlaps)
     {
-        return false;
-    }
+        UPrimitiveComponent* component = overlap.GetComponent();
 
-    UCapsuleComponent* capsule = pawn->FindComponentByClass<UCapsuleComponent>();
-
-    if (!capsule)
-    {
-        return false;
-    }
-
-    FVector start = pawn->GetActorLocation();
-
-    FVector direction = collectible->GetActorLocation() - start;
-
-    direction.Z = 0.0f;
-
-    float distance = direction.Size();
-
-    if (distance < KINDA_SMALL_NUMBER)
-    {
-        return true;
-    }
-
-    direction.Normalize();
-
-    FVector end = start + direction * distance;
-
-    float radius = capsule->GetScaledCapsuleRadius();
-
-    float halfHeight = capsule->GetScaledCapsuleHalfHeight();
-
-    FCollisionShape collisionShape = FCollisionShape::MakeCapsule(radius,halfHeight);
-    FCollisionQueryParams queryParams;
-    queryParams.AddIgnoredActor(pawn);
-    queryParams.AddIgnoredActor(collectible);
-
-    FHitResult hitResult;
-
-    bool hasObstacle =GetWorld()->SweepSingleByChannel(hitResult,start,end,FQuat::Identity,ECC_Visibility,collisionShape,queryParams);
-
-    return !hasObstacle;
-}
-
-// PLAYER DETECTION
-bool ASDTAIController::DetectPlayer(ASoftDesignTrainingMainCharacter*& player)
-{
-    APawn* pawn = GetPawn();
-
-    player = nullptr;
-
-    if (!pawn)
-    {
-        return false;
-    }
-
-    FCollisionObjectQueryParams objectQueryParams;
-    objectQueryParams.AddObjectTypesToQuery(COLLISION_PLAYER);
-
-    FCollisionQueryParams queryParams;
-    queryParams.AddIgnoredActor(pawn);
-
-    FCollisionShape detectionSphere =FCollisionShape::MakeSphere(m_playerDetectionRadius);
-
-    TArray<FOverlapResult> overlapResults;
-
-    bool hasOverlap =
-        GetWorld()->OverlapMultiByObjectType(
-            overlapResults,
-            pawn->GetActorLocation(),
-            FQuat::Identity,
-            objectQueryParams,
-            detectionSphere,
-            queryParams
-        );
-
-    if (!hasOverlap)
-    {
-        return false;
-    }
-
-    for (const FOverlapResult& overlap : overlapResults)
-    {
-        ASoftDesignTrainingMainCharacter* detectedPlayer =Cast<ASoftDesignTrainingMainCharacter>(overlap.GetActor());
-
-        if (detectedPlayer)
+        if (component)
         {
-            player = detectedPlayer;
-            return true;
+            ECollisionChannel channel = component->GetCollisionObjectType();
+            FVector closestPoint = FVector::Zero();
+
+            if (component->GetClosestPointOnCollision(position, closestPoint))
+            {
+                FVector pawnToTarget = closestPoint - position;
+                FVector direction = pawnToTarget.GetSafeNormal();
+
+                FColor color = FColor::White; //Color of non-interactive objects
+
+                FHitResult hit;
+
+                bool bHit = world->LineTraceSingleByChannel(hit, pawn->GetPawnViewLocation(), closestPoint + direction, ECC_Pawn, params);
+
+                switch (channel)
+                {
+                case ECC_WorldStatic: //Wall and ground
+                {
+                    if (hit.GetComponent() != component) //no line of sight
+                        break;
+
+                    if (pawnToTarget.Length() < GetReactDist())
+                        deltaV += ApplyAttractionForce(direction, deltaTime, false);
+
+                    color = FColor::Green;
+                    break;
+                }
+                case ECC_GameTraceChannel4:     //Player
+                {
+                    if (bHit)       //obstacle found
+                        break;
+
+                    if (m_Target != component && FVector::DotProduct(forward, direction) >= 0.5f) //always becomes priority target
+                        m_Target = component;
+
+                    ASoftDesignTrainingMainCharacter* player = (ASoftDesignTrainingMainCharacter*)overlap.GetActor();
+
+                    FVector approxNextPos = player->GetActorLocation() + player->GetVelocity() * deltaTime;
+                    FVector nextDir = (approxNextPos - position).GetSafeNormal();
+
+                    if (!player->IsPoweredUp())
+                        m_Velocity = FMath::VInterpTo(m_Velocity, 2.5f * m_WalkSpeed * nextDir, deltaTime, 1.0f);
+                    else
+                        m_Velocity = FMath::VInterpTo(m_Velocity, 2.5f * m_WalkSpeed * -nextDir, deltaTime, 1.0f);;
+
+                    color = FColor::Red;
+                    break;
+                }
+                case ECC_GameTraceChannel5:     //Collectible
+                {
+
+                    if (bHit) //no line of sightb broken
+                        break;
+
+                    if (!m_Target && FVector::DotProduct(forward, direction) >= 0.5f) //becomes main target if null
+                        m_Target = component;
+
+                    if (m_Target != component) //already has target
+                        break;
+
+                    ASDTCollectible* collectible = (ASDTCollectible*)overlap.GetActor();
+
+                    if (!collectible->IsOnCooldown())
+                        m_Velocity = FMath::VInterpTo(m_Velocity, m_WalkSpeed * direction, deltaTime, 1.0f);
+                    else
+                        m_Target = nullptr;
+
+                    color = FColor::Orange;
+                    break;
+                }
+                case ECC_GameTraceChannel3:     //DeathObject
+                {
+                    if (bHit) //no line of sight
+                        break;
+
+                    if (pawnToTarget.Length() < GetReactDist())
+                        deltaV += ApplyAttractionForce(direction, deltaTime, false);
+
+                    color = FColor::Blue;
+                    break;
+                }
+                case ECC_GameTraceChannel1:     //Projectile
+                {
+                    color = FColor::Purple;
+                    break;
+                }
+                }
+
+                DrawDebugLine(world, position, closestPoint, color);
+            }
         }
     }
 
-    return false;
+    return deltaV;
 }

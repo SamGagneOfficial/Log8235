@@ -9,10 +9,6 @@
 /**
  * 
  */
-
-class USoundBase;
-class UNiagaraSystem;
-
 UCLASS()
 class SOFTDESIGNTRAINING_API ASDTCollectible : public AStaticMeshActor
 {
@@ -34,12 +30,6 @@ public:
     virtual void BeginPlay() override;
 
     FVector initialPosition;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Feedback")
-    USoundBase* m_pickupSound = nullptr;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Feedback")
-    UParticleSystem* m_pickupFX = nullptr;
 
 protected:
     FTimerHandle m_CollectCooldownTimer;

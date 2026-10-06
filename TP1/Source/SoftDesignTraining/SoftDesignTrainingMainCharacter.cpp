@@ -2,7 +2,7 @@
 
 #include "SoftDesignTrainingMainCharacter.h"
 #include "SoftDesignTraining.h"
-#include "GameFramework/CharacterMovementComponent.h"
+
 #include "Camera/CameraComponent.h"
 #include "GameFramework/SpringArmComponent.h"
 
@@ -23,32 +23,6 @@ ASoftDesignTrainingMainCharacter::ASoftDesignTrainingMainCharacter()
     m_TopDownCameraComponent = CreateDefaultSubobject<UCameraComponent>(TEXT("TopDownCamera"));
     m_TopDownCameraComponent->SetupAttachment(m_CameraBoom, USpringArmComponent::SocketName);
     m_TopDownCameraComponent->bUsePawnControlRotation = false; // Camera does not rotate relative to arm;
-
-    //
-    bUseControllerRotationPitch = false;
-    bUseControllerRotationYaw = false;
-    bUseControllerRotationRoll = false;
-    GetCharacterMovement()->bOrientRotationToMovement = true; // Rotate character to moving direction
-    GetCharacterMovement()->RotationRate = FRotator(0.f, 720.f, 0.f);
-    GetCharacterMovement()->bConstrainToPlane = true;
-    GetCharacterMovement()->bSnapToPlaneAtStart = true;
-}
-
-void ASoftDesignTrainingMainCharacter::BeginPlay()
-{
-    Super::BeginPlay();
-
-    if (GetMesh())
-    {
-        FRotator meshRotation =
-            GetMesh()->GetRelativeRotation();
-
-        meshRotation.Yaw += 180.0f;
-
-        GetMesh()->SetRelativeRotation(
-            meshRotation
-        );
-    }
 }
 
 void ASoftDesignTrainingMainCharacter::OnBeginOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, UPrimitiveComponent* OtherComponent, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
